@@ -96,6 +96,29 @@ class ReviewRequest(StrictModel):
     export: str = Field(min_length=1)
 
 
+class SlimRequest(StrictModel):
+    """A review request plus the non-empty, distinct export columns to keep.
+
+    The whole graph is validated by the same rules as ``ReviewRequest`` before
+    anything is pruned. The column list must be non-empty with distinct,
+    non-empty names; existence of each name on the export node is checked in
+    the engine together with the rest of the graph.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    columns: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _column_names_distinct(self) -> "SlimRequest":
+        seen: set[str] = set()
+        for name in self.columns:
+            if name in seen:
+                raise ValueError(f"export column '{name}' is listed more than once")
+            seen.add(name)
+        return self
+
+
 class ReviseRequest(StrictModel):
     """A review request plus the export columns the caller allows nulling.
 

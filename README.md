@@ -11,6 +11,10 @@
 服务还提供 `POST /api/revise`：在审查结论基础上把图修订成一张**可再次提交、复审判安全**的
 导出图（只允许在导出末尾追加一个投影节点），详见下文“安全修订”。
 
+此外提供 `POST /api/slim`：给定导出节点上**选中的导出列**，在保持数据与行集合语义的前提下
+精简整图——删除无关节点与输出列，所选列的内容影响与行影响原因和原图完全一致（**不改变安全结论**），
+详见下文“按列精简”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -36,6 +40,10 @@
 
 `POST /api/revise` 复用上述全部校验（重复 ID、列名冲突、无效引用、环、超过 60 节点等同样拒绝），
 额外把 `allowed_replacements` 的列名重复判为 422，把允许列不存在及各类不可修订情形判为 400。
+
+`POST /api/slim` 同样先复用上述全部校验，再额外把 `columns` 的缺失/为空、列名重复或为空
+判为 422，把选中列不存在（`SLIM_COLUMN_NOT_FOUND`）、追加投影超 60 节点
+（`SLIM_NODE_LIMIT`）等判为 400。
 
 ## 单条命令启动
 
@@ -288,6 +296,86 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 #   "row_reasons":[{"node_id":"s","column":"id_card"}]}}
 ```
 
+## 按列精简：POST /api/slim
+
+按选中的导出列精简整图，同时保持**数据与行集合语义**。请求体在审查请求基础上增加
+`columns`：非空、互异、非空字符串的导出列名列表。服务先按 `/api/review` 的原规则
+**校验整张原图**（包括导出不可达的分支）与列名，原有错误行为不变。
+
+精简规则：
+
+1. **保留导出节点及其全部依赖祖先**，删除其余节点（含不可达分支）。
+2. **反向传播列需求**（共享节点取各分支需求的并集）：
+   * `projection`：只保留被需要的输出列；`copy` 输出向上游需求对应源列，`constant`
+     输出**不要求上游任何列内容**，但其输入关系节点本身不能删除；
+   * `filter`：保留全部条件 `references` 引用列，以及需要透传的列；
+   * `join`：保留两侧连接键（左右输入关系都不能删除），只保留被需要的输出别名；
+   * `source`：**列不裁剪**，`sensitive` 标记原样保留。
+3. **无列需求时**：非导出的投影/连接节点保留其**原第一输出**及该输出的依赖；导出节点
+   永远只按选中列处理，不触发该兜底。
+4. 当导出节点本身是 `source`/`filter`（列原样透传）、精简后**仍含未选列**时，在末尾
+   **追加一个 ID 不冲突**的投影节点（`{导出ID}__slim_export`，冲突自动换名），按**原导出
+   列序**复制全部选中列；投影/连接导出则就地裁剪，不追加节点。
+5. 保留**原节点 ID**、节点的相对顺序、列的相对顺序；不改敏感标记、常量值与筛选条件。
+6. 精简只做裁剪，**不要求变安全**：所选列的 `content_reasons` / `row_reasons`（以及
+   `blocked`）与原图逐一相同。
+
+拒绝（返回 HTTP 400，**不返回部分图**）：
+
+* 选中列在导出节点上不存在：`SLIM_COLUMN_NOT_FOUND`；
+* 追加投影会使节点数**超过 60**：`SLIM_NODE_LIMIT`；
+* 精简后复审与原图所选列结论不一致：`SLIM_REVIEW_MISMATCH`（理论上的内部不变量）。
+
+原图本身的错误（重复 ID、列名冲突、无效引用、环等）仍按原规则返回原有错误码；
+`columns` 为空/缺失、列名重复或为空字符串、未知字段等 schema 问题返回 HTTP 422。
+
+成功响应包含完整 `nodes`、最终 `export`（就地裁剪时为原导出 ID，追加投影时为新 ID），
+以及用原规则对精简结果**复审**的 `review`；该图可直接再 POST 到 `/api/review`。
+
+### 精简并复审（可直接执行）
+
+```bash
+# 1) 发起精简：只保留 user_id 与 bucket；mail 输出列与 audit_branch 分支被删除，
+#    filter 对 country 的引用、两侧之外的源列依赖按规则保留
+curl -s -X POST http://localhost:8080/api/slim \
+  -H 'Content-Type: application/json' \
+  --data @examples/slim_request.json
+```
+
+返回（节选）：`audit_branch` 节点已删除，导出投影就地只剩两列，复审结论与原图对应列一致：
+
+```json
+{
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email", "sensitive": true},
+      {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn", "columns": [
+      {"name": "user_id", "copy": "uid"},
+      {"name": "bucket", "constant": "ALL"}]}
+  ],
+  "export": "export_users",
+  "review": {"export": "export_users", "blocked": false, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+```bash
+# 2) 用 POST /api/review 复审返回的图（需要 jq；结论应与响应中的 review 完全相同）
+curl -s -X POST http://localhost:8080/api/slim \
+  -H 'Content-Type: application/json' \
+  --data @examples/slim_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+```
+
+导出节点是 `source`/`filter` 且仍有未选列时，会在末尾追加投影，例如导出为 `source`、
+只选 `b`：响应节点为原 source（列不动）加一个 `s__slim_export` 投影，最终只含 `b`。
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -323,11 +411,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含修订请求 ReviseRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查与安全修订
-app/main.py       FastAPI 入口（POST /api/review、POST /api/revise、GET /health）
-examples/         请求示例（request.json、revise_request.json）
-tests/            传播规则、拒绝场景与修订/复审测试
+app/models.py     请求模型与结构约束（Pydantic；含修订请求 ReviseRequest、精简请求 SlimRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订与按列精简
+app/main.py       FastAPI 入口（POST /api/review、POST /api/revise、POST /api/slim、GET /health）
+examples/         请求示例（request.json、revise_request.json、slim_request.json）
+tests/            传播规则、拒绝场景与修订/精简/复审测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```

@@ -30,6 +30,7 @@ from .models import (
     ProjectionNodeIn,
     ReviewRequest,
     ReviseRequest,
+    SlimRequest,
     SourceNodeIn,
 )
 
@@ -276,7 +277,7 @@ def _build_by_id(nodes: list[object]) -> dict[str, object]:
 
 
 def _evaluate_graph(
-    request: Union[ReviewRequest, ReviseRequest],
+    request: Union[ReviewRequest, ReviseRequest, SlimRequest],
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
 
@@ -354,15 +355,19 @@ def serialize_node(node: object) -> dict[str, object]:
     return node.model_dump(by_alias=True, exclude_unset=True)  # type: ignore[attr-defined]
 
 
-def _safe_projection_id(export_id: str, by_id: dict[str, object]) -> str:
-    """Pick a deterministic projection id that cannot collide with originals."""
-    base = f"{export_id}__safe_export"
+def _safe_node_id(base: str, by_id: dict[str, object]) -> str:
+    """Pick a deterministic id derived from ``base`` that cannot collide."""
     candidate = base
     suffix = 2
     while candidate in by_id:
         candidate = f"{base}_{suffix}"
         suffix += 1
     return candidate
+
+
+def _safe_projection_id(export_id: str, by_id: dict[str, object]) -> str:
+    """Pick a deterministic projection id that cannot collide with originals."""
+    return _safe_node_id(f"{export_id}__safe_export", by_id)
 
 
 def revise(request: ReviseRequest) -> dict[str, object]:
@@ -479,4 +484,202 @@ def revise(request: ReviseRequest) -> dict[str, object]:
         "revised": True,
         "replaced_columns": replaced_columns,
         "review": re_review_result,
+    }
+
+
+def slim(request: SlimRequest) -> dict[str, object]:
+    """Prune the graph to the selected export columns, keeping data/row semantics.
+
+    The original graph is validated and reviewed under exactly the same rules
+    as :func:`review`; validation failures reject the whole request as before.
+    Column requirements are then propagated backwards from the export node:
+
+    * the export and every required ancestor survive, everything else is cut;
+    * a projection keeps only outputs that are wanted; a copied output demands
+      its source column, a constant demands nothing from its input relation;
+    * a filter keeps its condition references and every column that must pass
+      through it; a join keeps both keys and only the wanted output aliases;
+    * shared nodes merge the requirements of every branch that consumes them;
+    * source columns are never trimmed.
+
+    A projection or join with no column requirement keeps its original first
+    output and that output's dependencies; constants never save the input
+    relation from being kept. When the export itself still carries unselected
+    columns (only possible for a source/filter), one projection is appended.
+    """
+    by_id, order, relations = _evaluate_graph(request)
+    export_relation = relations[request.export]
+    export_names = {c.name for c in export_relation.columns}
+
+    missing = [name for name in request.columns if name not in export_names]
+    if missing:
+        raise ValidationError(
+            "SLIM_COLUMN_NOT_FOUND",
+            "requested export column(s) not found on export node "
+            f"'{request.export}': " + ", ".join(missing),
+            request.export,
+            {"columns": missing},
+        )
+
+    selected = list(request.columns)
+    selected_set = set(selected)
+    export_is_passthrough = isinstance(
+        by_id[request.export], (SourceNodeIn, FilterNodeIn)
+    )
+
+    def effective_wants(nid: str, node: object, wants: set[str]) -> set[str]:
+        """Output names that must survive on a retained node.
+
+        The export keeps exactly the selected names. Any other projection/join
+        with no column requirement keeps its original first output.
+        """
+        if nid == request.export or wants:
+            return wants
+        if isinstance(node, ProjectionNodeIn):
+            return {node.columns[0].name}
+        if isinstance(node, JoinNodeIn):
+            return {node.outputs[0].alias}
+        return wants
+
+    # Backward fixed-point over the reverse topological order: every retained
+    # node's output requirements are propagated to its inputs exactly once.
+    retained: set[str] = {request.export}
+    needed: dict[str, set[str]] = defaultdict(set)
+    needed[request.export] |= selected_set
+
+    for nid in reversed(order):
+        if nid not in retained:
+            continue
+        node = by_id[nid]
+        wants = effective_wants(nid, node, needed[nid])
+
+        if isinstance(node, SourceNodeIn):
+            # Source columns are never trimmed: nothing to propagate.
+            continue
+
+        if isinstance(node, ProjectionNodeIn):
+            retained.add(node.input)
+            for spec in node.columns:
+                if spec.name in wants and not spec.is_constant:
+                    # Constants demand no upstream content, but the input
+                    # relation itself must remain for row-set semantics.
+                    needed[node.input].add(spec.copy_name)
+
+        elif isinstance(node, FilterNodeIn):
+            retained.add(node.input)
+            # Pass-through columns plus every column the condition references.
+            needed[node.input] |= wants | set(node.references)
+
+        else:  # join
+            kept_outs = [out for out in node.outputs if out.alias in wants]
+            side_inputs = {"left": node.left_input, "right": node.right_input}
+            side_keys = {"left": node.left_key, "right": node.right_key}
+            side_cols: dict[str, set[str]] = defaultdict(set)
+            for out in kept_outs:
+                side_cols[out.side].add(out.column)
+            # Both join keys are always required, so both input relations stay.
+            for side in ("left", "right"):
+                input_id = side_inputs[side]
+                retained.add(input_id)
+                needed[input_id].add(side_keys[side])
+                needed[input_id] |= side_cols[side]
+
+    # Serialize retained nodes in the original request order, pruning only the
+    # output column lists of projections and joins.
+    pruned_nodes: list[dict[str, object]] = []
+    for node in request.nodes:
+        if node.id not in retained:
+            continue
+        data = serialize_node(node)
+        if isinstance(node, (ProjectionNodeIn, JoinNodeIn)):
+            wants = effective_wants(node.id, node, needed[node.id])
+            if isinstance(node, ProjectionNodeIn):
+                data["columns"] = [
+                    serialize_node(spec)
+                    for spec in node.columns
+                    if spec.name in wants
+                ]
+            else:
+                data["outputs"] = [
+                    out.model_dump(by_alias=True)
+                    for out in node.outputs
+                    if out.alias in wants
+                ]
+        pruned_nodes.append(data)
+
+    final_export = request.export
+
+    # A source/filter export passes every input column through; when unselected
+    # columns remain, append one trailing projection. Projection/join exports
+    # are pruned in place and never need one.
+    if export_is_passthrough and export_names - selected_set:
+        if len(pruned_nodes) + 1 > NODE_LIMIT:
+            raise ValidationError(
+                "SLIM_NODE_LIMIT",
+                f"appending the slim-export projection would exceed the "
+                f"{NODE_LIMIT}-node limit (slimmed graph already has "
+                f"{len(pruned_nodes)} nodes)",
+                request.export,
+                {"node_count": len(pruned_nodes) + 1, "limit": NODE_LIMIT},
+            )
+        projection_id = _safe_node_id(
+            f"{request.export}__slim_export",
+            {n["id"]: None for n in pruned_nodes},
+        )
+        pruned_nodes.append(
+            {
+                "id": projection_id,
+                "type": "projection",
+                "input": request.export,
+                # The export relation is unchanged by pruning (filter/source
+                # pass columns through), so every selected name copies there.
+                # Column order follows the original export column order.
+                "columns": [
+                    {"name": column.name, "copy": column.name}
+                    for column in export_relation.columns
+                    if column.name in selected_set
+                ],
+            }
+        )
+        final_export = projection_id
+
+    # Re-validate and re-review the constructed graph under the original rules.
+    slimmed_request = ReviewRequest.model_validate(
+        {"nodes": pruned_nodes, "export": final_export}
+    )
+    review_result = review(slimmed_request)
+    final_columns = {c["name"]: c for c in review_result["columns"]}
+
+    if set(final_columns) != selected_set:  # pragma: no cover - invariant
+        raise ValidationError(
+            "SLIM_REVIEW_MISMATCH",
+            "internal error: the slimmed export does not carry exactly the "
+            "selected columns",
+            final_export,
+            {"columns": sorted(final_columns)},
+        )
+
+    # Semantic cross-check against the original review: selected columns keep
+    # the same content and row-level reasons as in the original graph.
+    original_review = _review_export(request.export, relations)
+    original_columns = {c["name"]: c for c in original_review["columns"]}
+    for name in selected:
+        before = original_columns[name]
+        after = final_columns[name]
+        if (
+            after["content_reasons"] != before["content_reasons"]
+            or after["row_reasons"] != before["row_reasons"]
+        ):  # pragma: no cover - invariant by construction
+            raise ValidationError(
+                "SLIM_REVIEW_MISMATCH",
+                "internal error: the slimmed graph changed the review result "
+                f"of selected column '{name}'",
+                final_export,
+                {"column": name},
+            )
+
+    return {
+        "nodes": pruned_nodes,
+        "export": final_export,
+        "review": review_result,
     }

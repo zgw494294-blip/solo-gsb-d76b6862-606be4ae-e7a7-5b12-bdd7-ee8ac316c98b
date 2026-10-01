@@ -3,17 +3,19 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .engine import ValidationError, review, revise
-from .models import ReviewRequest, ReviseRequest
+from .engine import ValidationError, review, revise, slim
+from .models import ReviewRequest, ReviseRequest, SlimRequest
 
 app = FastAPI(
     title="Local Data Export Risk Review API",
     description=(
         "Reviews every output column of an export node for sensitive content "
-        "provenance and sensitive row-level influence, and can revise a blocked "
-        "graph into a re-submittable, review-safe export."
+        "provenance and sensitive row-level influence, can revise a blocked "
+        "graph into a re-submittable, review-safe export, and can slim a graph "
+        "down to selected export columns while preserving data and row-set "
+        "semantics."
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -44,3 +46,8 @@ async def review_export(request: ReviewRequest) -> dict[str, object]:
 @app.post("/api/revise")
 async def revise_export(request: ReviseRequest) -> dict[str, object]:
     return revise(request)
+
+
+@app.post("/api/slim")
+async def slim_export(request: SlimRequest) -> dict[str, object]:
+    return slim(request)
