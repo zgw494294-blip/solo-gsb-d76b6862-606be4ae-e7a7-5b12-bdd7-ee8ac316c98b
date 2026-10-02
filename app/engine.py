@@ -28,6 +28,7 @@ from .models import (
     FilterNodeIn,
     JoinNodeIn,
     ProjectionNodeIn,
+    PruneRequest,
     ReviewRequest,
     ReviseRequest,
     SourceNodeIn,
@@ -276,7 +277,7 @@ def _build_by_id(nodes: list[object]) -> dict[str, object]:
 
 
 def _evaluate_graph(
-    request: Union[ReviewRequest, ReviseRequest],
+    request: Union[ReviewRequest, ReviseRequest, PruneRequest],
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
 
@@ -479,4 +480,290 @@ def revise(request: ReviseRequest) -> dict[str, object]:
         "revised": True,
         "replaced_columns": replaced_columns,
         "review": re_review_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pruning by selected export columns
+# ---------------------------------------------------------------------------
+
+
+def _ancestors(export_id: str, by_id: dict[str, object]) -> set[str]:
+    """All nodes the export depends on (the export itself included).
+
+    A shared node feeds every branch that needs it; the ancestor closure is
+    exactly the node set that may influence the export's columns or row set.
+    Every input relation of a retained node is therefore retained too — a
+    constant-only projection keeps its upstream even though it copies nothing.
+    """
+    keep: set[str] = {export_id}
+    stack = [export_id]
+    while stack:
+        for ref in _inputs(by_id[stack.pop()]):
+            if ref not in keep:
+                keep.add(ref)
+                stack.append(ref)
+    return keep
+
+
+def _safe_projection_id_from(base: str, used: set[str]) -> str:
+    """Pick a deterministic projection id that cannot collide with ``used``."""
+    candidate = f"{base}__export"
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}__export_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _column_reason_view(review_result: dict[str, object]) -> dict[str, object]:
+    """Map column name -> (content reasons, row reasons) for review comparison."""
+    return {
+        col["name"]: (col["content_reasons"], col["row_reasons"])
+        for col in review_result["columns"]
+    }
+
+
+def _compare_selected_columns(
+    original: dict[str, object],
+    pruned: dict[str, object],
+    selected: list[str],
+) -> dict[str, object]:
+    """Return per-column discrepancies of the pruned review against original.
+
+    The pruned export must expose exactly the selected columns, in the export's
+    original order, and every one must carry the same content/row reasons as in
+    the original graph (pruning is not a safety transform, so reasons must be
+    preserved, never weakened). Used both by :func:`prune` and its tests.
+    """
+    orig_cols = _column_reason_view(original)
+    pruned_cols = _column_reason_view(pruned)
+    pruned_order = list(pruned_cols)
+
+    diffs: dict[str, object] = {}
+    missing = [name for name in selected if name not in pruned_cols]
+    extra = [name for name in pruned_order if name not in selected]
+    if missing:
+        diffs["missing_columns"] = missing
+    if extra:
+        diffs["extra_columns"] = extra
+    if pruned_order != selected:
+        diffs["expected_order"] = selected
+        diffs["actual_order"] = pruned_order
+
+    mismatched: list[dict[str, object]] = []
+    for name in selected:
+        if name not in pruned_cols or name not in orig_cols:
+            continue
+        o_content, o_rows = orig_cols[name]
+        p_content, p_rows = pruned_cols[name]
+        if o_content != p_content or o_rows != p_rows:
+            mismatched.append(
+                {
+                    "name": name,
+                    "original": {
+                        "content_reasons": o_content,
+                        "row_reasons": o_rows,
+                    },
+                    "pruned": {
+                        "content_reasons": p_content,
+                        "row_reasons": p_rows,
+                    },
+                }
+            )
+    if mismatched:
+        diffs["mismatched_columns"] = mismatched
+    return diffs
+
+
+def prune(request: PruneRequest) -> dict[str, object]:
+    """Narrow a graph to a chosen subset of export columns.
+
+    The whole original graph is validated exactly as :func:`review` does, and
+    every selected column must exist on the export node. The export node and
+    all of its ancestor nodes are retained (shared nodes satisfy every branch
+    feeding them); nodes unreachable from the export are dropped. Columns are
+    then narrowed bottom-up by a reverse dependency-demand pass:
+
+    * source columns are never trimmed;
+    * a filter keeps its referenced columns and every column its consumers
+      need;
+    * a projection and a join emit only the outputs that are needed — except
+      the export node, which is left fully intact;
+    * a retained projection/join with no demanded output keeps its original
+      first output (and that output's dependencies);
+    * both join keys are always demanded on their side inputs.
+
+    When the export still contains columns the caller did not select, one
+    trailing projection (copying only the selected columns, in original order)
+    is appended so the final export exposes exactly the chosen columns. The
+    result must stay within the 60-node cap and re-review identically for the
+    selected columns; otherwise the request is rejected without any partial
+    graph.
+    """
+    by_id, order, relations = _evaluate_graph(request)
+    export_relation = relations[request.export]
+    export_columns = [c.name for c in export_relation.columns]
+    export_column_set = set(export_columns)
+
+    # The selection is part of the request contract: every name must resolve on
+    # the export node (distinctness/non-emptiness is enforced by the model).
+    missing = [name for name in request.columns if name not in export_column_set]
+    if missing:
+        raise ValidationError(
+            "PRUNE_COLUMN_NOT_FOUND",
+            "selected column(s) not found on export node "
+            f"'{request.export}': " + ", ".join(missing),
+            request.export,
+            {"columns": missing},
+        )
+
+    selected_set = set(request.columns)
+    selected_in_order = [name for name in export_columns if name in selected_set]
+    original_review = _review_export(request.export, relations)
+
+    # --- node retention: export plus every dependency ancestor --------------
+    keep = _ancestors(request.export, by_id)
+
+    # --- reverse pass: which output columns each retained node must emit ----
+    # The export node stays fully intact: seed every one of its outputs.
+    demanded: dict[str, set[str]] = {request.export: set(export_columns)}
+    for nid in reversed(order):
+        if nid not in keep:
+            continue
+        node = by_id[nid]
+        needed = demanded.setdefault(nid, set())
+
+        if isinstance(node, SourceNodeIn):
+            continue  # source columns are never trimmed
+
+        if isinstance(node, FilterNodeIn):
+            # Keep the predicate columns and whatever downstream still reads.
+            demanded.setdefault(node.input, set()).update(needed)
+            demanded[node.input].update(node.references)
+
+        elif isinstance(node, ProjectionNodeIn):
+            if nid != request.export:
+                specs_by_name = {spec.name: spec for spec in node.columns}
+                if not needed:
+                    # No live output: preserve the node's first output instead
+                    # of emitting an (illegal) empty projection. Mutate the set
+                    # stored in ``demanded`` so the build phase sees the choice.
+                    needed.add(node.columns[0].name)
+                for name in needed:
+                    spec = specs_by_name[name]
+                    if not spec.is_constant:
+                        # A constant demands no upstream content, but its input
+                        # relation stays via the ancestor closure.
+                        demanded.setdefault(node.input, set()).add(spec.copy_name)
+            else:
+                # Export is untouched: every copy target must remain available.
+                demanded.setdefault(node.input, set())
+                for spec in node.columns:
+                    if not spec.is_constant:
+                        demanded[node.input].add(spec.copy_name)
+
+        else:  # JoinNodeIn
+            if nid != request.export and not needed:
+                needed.add(node.outputs[0].alias)
+            left_need = demanded.setdefault(node.left_input, set())
+            right_need = demanded.setdefault(node.right_input, set())
+            # Both keys are always required: they shape the joined row set.
+            left_need.add(node.left_key)
+            right_need.add(node.right_key)
+            outputs_by_alias = {out.alias: out for out in node.outputs}
+            for alias in needed:
+                out = outputs_by_alias[alias]
+                if out.side == "left":
+                    left_need.add(out.column)
+                else:
+                    right_need.add(out.column)
+
+    # --- build the pruned nodes, keeping the original list/column order -----
+    new_node_dicts: list[dict[str, object]] = []
+    trimmed = False
+    for node in request.nodes:
+        nid = node.id
+        if nid not in keep:
+            continue
+        data = serialize_node(node)
+
+        if isinstance(node, ProjectionNodeIn) and nid != request.export:
+            wanted = demanded[nid]
+            kept_cols = [
+                col for col in data["columns"] if col["name"] in wanted
+            ]
+            if len(kept_cols) != len(data["columns"]):
+                trimmed = True
+            data["columns"] = kept_cols
+
+        elif isinstance(node, JoinNodeIn) and nid != request.export:
+            wanted = demanded[nid]
+            kept_outs = [
+                out for out in data["outputs"] if out["alias"] in wanted
+            ]
+            if len(kept_outs) != len(data["outputs"]):
+                trimmed = True
+            data["outputs"] = kept_outs
+
+        new_node_dicts.append(data)
+
+    dropped_nodes = [node.id for node in request.nodes if node.id not in keep]
+
+    # --- trailing projection when the export still has unselected columns ---
+    needs_trailing = set(export_columns) != selected_set
+    if needs_trailing and len(new_node_dicts) + 1 > NODE_LIMIT:
+        raise ValidationError(
+            "PRUNE_NODE_LIMIT",
+            f"appending the export projection would exceed the {NODE_LIMIT}-node "
+            f"limit (pruned graph already has {len(new_node_dicts)} nodes)",
+            request.export,
+            {"node_count": len(new_node_dicts) + 1, "limit": NODE_LIMIT},
+        )
+
+    final_export = request.export
+    added_node = False
+    if needs_trailing:
+        trailing_id = _safe_projection_id_from(
+            request.export, {n["id"] for n in new_node_dicts}
+        )
+        new_node_dicts.append(
+            {
+                "id": trailing_id,
+                "type": "projection",
+                "input": request.export,
+                "columns": [
+                    {"name": name, "copy": name} for name in selected_in_order
+                ],
+            }
+        )
+        final_export = trailing_id
+        added_node = True
+
+    # --- validate and re-review the constructed graph under original rules --
+    re_payload = ReviewRequest.model_validate(
+        {"nodes": new_node_dicts, "export": final_export}
+    )
+    pruned_review = review(re_payload)
+
+    diffs = _compare_selected_columns(
+        original_review, pruned_review, selected_in_order
+    )
+    if diffs:  # pragma: no cover - invariant by the demand construction
+        raise ValidationError(
+            "PRUNE_REVIEW_MISMATCH",
+            "the pruned export does not preserve the original review for the "
+            "selected columns",
+            final_export,
+            {"differences": diffs},
+        )
+
+    return {
+        "nodes": new_node_dicts,
+        "export": final_export,
+        "columns": selected_in_order,
+        "pruned": bool(dropped_nodes or trimmed or added_node),
+        "dropped_nodes": dropped_nodes,
+        "added_projection": final_export if added_node else None,
+        "review": pruned_review,
     }

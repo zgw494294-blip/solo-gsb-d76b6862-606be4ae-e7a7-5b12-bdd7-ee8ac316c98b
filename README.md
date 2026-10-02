@@ -11,6 +11,10 @@
 服务还提供 `POST /api/revise`：在审查结论基础上把图修订成一张**可再次提交、复审判安全**的
 导出图（只允许在导出末尾追加一个投影节点），详见下文“安全修订”。
 
+此外提供 `POST /api/prune`：按选定的导出列把图**精简**为只保留这些列及其全部依赖祖先的
+等价图——删除无关分支与无用投影/连接输出，最终导出只含选定列（沿用原列序），所选列的内容与
+行影响原因与原图完全一致，详见下文“按导出列精简”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -288,6 +292,113 @@ curl -s -i -X POST http://localhost:8080/api/revise \
 #   "row_reasons":[{"node_id":"s","column":"id_card"}]}}
 ```
 
+## 按导出列精简：POST /api/prune
+
+按**选定的导出列**把图精简为语义等价的最小图。请求体在审查请求基础上增加 `columns`：
+**非空、列名非空且互异**的导出列名列表（顺序不影响结果，最终列序一律沿用导出节点的原列序）。
+整张图先按 `/api/review` 的原规则校验，原有错误行为不变；随后每个选定列名都必须存在于导出节点。
+
+### 精简规则
+
+1. **节点保留**：保留导出节点及其**全部依赖祖先**，删除从导出不可达的其余节点。
+   共享节点满足所有引用它的分支需求（一个节点同时喂给筛选与连接时取需求并集，不复制节点）。
+   常量列不要求上游**列**，但其输入**关系**（节点）不能删除。
+2. **反向需求传播**（自导出向上游）：
+   * **source 不裁剪**，源列与 `sensitive` 标记原样保留；
+   * **filter** 保留条件 `references` 引用列，以及其下游仍需读取的列；条件不被修改；
+   * **projection / join 只保留被需要的输出**；两侧**连接键始终保留**（它们决定行集合）；
+   * 某投影/连接虽被保留但已无任何被需要的输出时，保留其**原第一个输出**及其依赖，
+     绝不产生空输出的非法节点；
+   * **导出节点本身不裁剪**（其输出、常量、连接键与条件保持原样）。
+3. **尾部投影**：当导出节点仍含未选定列时，在其后追加一个 ID 不与已有节点冲突的
+   `projection`（输入即原导出节点），只按**原列序** `copy` 选定列；导出已只含选定列时不追加。
+4. **保持不变量**：保留原节点 ID；保留节点在原请求中的相对顺序，以及节点内列/别名的相对顺序；
+   不修改 `sensitive` 标记、常量值与筛选条件。
+5. **语义等价但不“变安全”**：最终导出只含选定列；每个选定列的 `content_reasons` /
+   `row_reasons` 与原图**完全相同**（敏感列精简后依然阻断，行影响不会因删列而消失）。
+
+### 拒绝（HTTP 400，不返回部分图）
+
+* 选定列名在导出节点上不存在（即使图本身安全也检查）：`PRUNE_COLUMN_NOT_FOUND`；
+* 需要追加尾部投影且追加后节点数**超过 60**：`PRUNE_NODE_LIMIT`；
+* 构造出的精简图对选定列的复审与原图不一致：`PRUNE_REVIEW_MISMATCH`（内部不变量，正常不会出现）；
+* 以及 `/api/review` 的全部原图校验（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
+  `INVALID_REFERENCE` / `CYCLE`）——整次请求先校验整张原图，无关分支的错误同样拒绝。
+
+`columns` 为空或缺失、含空字符串或重复列名、未知字段、节点超过 60 等 schema 问题返回 HTTP 422。
+
+成功响应包含：完整 `nodes`（精简后的图）、最终 `export`、按原列序的 `columns`、
+`dropped_nodes`（被删除的不可达节点，按原顺序）、`added_projection`（追加节点 ID 或 `null`）、
+`pruned`（是否发生任何删除/裁剪/追加），以及用原规则对最终导出**复审**的 `review`。
+
+### 精简并用 POST /api/review 复审（可直接执行）
+
+```bash
+# 1) 发起精简（示例文件：只保留 user_id 与 bucket；列序沿用导出节点）
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  --data @examples/prune_request.json
+```
+
+返回（节选）：导出节点 `export_users` 原样保留，末尾追加只复制两列的投影
+`export_users__export`；最终只含选定列、沿用原列序：
+
+```json
+{
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "uid", "sensitive": false},
+      {"name": "email", "sensitive": true},
+      {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn", "columns": [
+      {"name": "user_id", "copy": "uid"},
+      {"name": "mail", "copy": "email"},
+      {"name": "bucket", "constant": "ALL"}]},
+    {"id": "export_users__export", "type": "projection",
+     "input": "export_users", "columns": [
+       {"name": "user_id", "copy": "user_id"},
+       {"name": "bucket", "copy": "bucket"}]}
+  ],
+  "export": "export_users__export",
+  "columns": ["user_id", "bucket"],
+  "pruned": true,
+  "dropped_nodes": [],
+  "added_projection": "export_users__export",
+  "review": {"export": "export_users__export", "blocked": false, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+```bash
+# 2) 用原审查接口 POST /api/review 复审返回的精简图（需要 jq）
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  --data @examples/prune_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+```
+
+选定列的原因与原图一致：若选定的是敏感列 `mail`，精简后复审仍判阻断（精简不“变安全”）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.columns = ["mail"]' examples/prune_request.json)"
+# review.columns[0].content_reasons 仍为 [{"node_id":"users","column":"email"}]，blocked 为 true
+```
+
+选定列名不存在时返回 400 且不带任何部分图：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/prune \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.columns = ["ghost"]' examples/prune_request.json)"
+# HTTP/1.1 400 ... {"error":{"code":"PRUNE_COLUMN_NOT_FOUND", ...
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -323,11 +434,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含修订请求 ReviseRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查与安全修订
-app/main.py       FastAPI 入口（POST /api/review、POST /api/revise、GET /health）
-examples/         请求示例（request.json、revise_request.json）
-tests/            传播规则、拒绝场景与修订/复审测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest 与 PruneRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订与按列精简
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json）
+tests/            传播规则、拒绝场景、修订/复审与精简测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```

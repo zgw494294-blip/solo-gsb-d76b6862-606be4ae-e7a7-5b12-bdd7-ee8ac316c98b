@@ -123,3 +123,29 @@ class ReviseRequest(StrictModel):
                 )
             seen.add(name)
         return self
+
+
+class PruneRequest(StrictModel):
+    """A review request plus the export columns the caller wants to keep.
+
+    ``columns`` selects a non-empty subset of the export node's columns. The
+    names must be non-empty and distinct (their order never matters: the result
+    always follows the export node's original column order). The whole graph is
+    still validated by the same rules as ``ReviewRequest``; existence of every
+    selected name on the export node is checked in the engine.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    columns: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _column_names_distinct(self) -> "PruneRequest":
+        seen: set[str] = set()
+        for name in self.columns:
+            if name in seen:
+                raise ValueError(
+                    f"selected column '{name}' is listed more than once"
+                )
+            seen.add(name)
+        return self
